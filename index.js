@@ -26,8 +26,13 @@ webpush.setVapidDetails(
   PRIVATE_VAPID_KEY
 );
 
-// Хранилище данных (в оперативной памяти)
-let subscribers = [];
+// === ИЗМЕНЕНИЕ: Хранилище теперь умное ===
+// Было: let subscribers = [];
+// Стало: Объект клиентов по ID
+// Формат: { 'user_123': { subscription: {...}, watchedIds: ['1001', '1002'] } }
+let clients = {};
+
+// Хранилище уже отправленных СМС
 let lastSmsData = {}; 
 
 // ==========================================
@@ -35,30 +40,22 @@ let lastSmsData = {};
 // ==========================================
 
 /**
- * Отправляет Push-уведомление всем подписчикам
- * @param {string} title - Заголовок (например, номер телефона)
- * @param {string} body - Текст уведомления (например, код)
+ * Отправляет Push-уведомление КОНКРЕТНОМУ подписчику
  */
-const sendPushToAll = (title, body) => {
-  if (subscribers.length === 0) return;
-
+const sendPushToClient = (subscription, title, body) => {
   const payload = JSON.stringify({
     title: title,
     body: body,
   });
 
-  console.log(`📤 Push: [${title}] -> ${body}`);
+  console.log(`📤 Push (Personal): [${title}] -> ${body}`);
 
-  subscribers.forEach((sub, index) => {
-    webpush.sendNotification(sub, payload).catch(err => {
-      // Если устройство недоступно или отписалось (410 Gone, 404 Not Found)
-      if (err.statusCode === 410 || err.statusCode === 404) {
-        subscribers.splice(index, 1); // Удаляем из списка
-        console.log('🗑 Удален неактивный подписчик');
-      } else {
-        console.error('Ошибка отправки:', err.message);
-      }
-    });
+  webpush.sendNotification(subscription, payload).catch(err => {
+    if (err.statusCode === 410 || err.statusCode === 404) {
+      console.log('💀 Подписка неактивна (клиент удален)');
+    } else {
+      console.error('Ошибка отправки:', err.message);
+    }
   });
 };
 
@@ -69,23 +66,14 @@ const checkSmsLoop = async () => {
   try {
     const url = `${HERO_URL}?api_key=${HERO_API_KEY}&action=getActiveActivations`;
     
-    // Делаем запрос
     const response = await fetch(url);
     const text = await response.text(); 
 
-    // Если номеров нет, API возвращает строку
     if (text === 'NO_ACTIVATIONS') return;
 
-    // Пробуем парсить JSON
     let data;
-    try {
-        data = JSON.parse(text);
-    } catch (e) {
-        // Игнорируем ошибки парсинга, если это не валидный JSON
-        return;
-    }
+    try { data = JSON.parse(text); } catch (e) { return; }
 
-    // Нормализация данных (API может вернуть объект или массив)
     let activations = [];
     if (data.activeActivations) {
       if (Array.isArray(data.activeActivations)) {
@@ -97,25 +85,36 @@ const checkSmsLoop = async () => {
 
     // Проходим по всем активным номерам
     activations.forEach(item => {
-      const id = item.activationId;
+      const id = String(item.activationId); // ID активации
       const codeRaw = item.smsCode;
       
-      // HeroSMS иногда шлет код массивом, иногда строкой
       const finalCode = Array.isArray(codeRaw) ? codeRaw[0] : codeRaw;
-
-      // Формируем красивый номер телефона для заголовка
       const phoneNumber = item.phoneNumber ? `+${item.phoneNumber}` : 'SMS Code';
 
-      // ЛОГИКА ОТПРАВКИ:
-      // Если код есть (не null) И мы этот код для этого ID еще не отправляли
+      // ЛОГИКА: Если пришел НОВЫЙ код
       if (finalCode && lastSmsData[id] !== finalCode) {
         
-        console.log(`🚀 НОВАЯ СМС! Tel: ${phoneNumber}, Code: ${finalCode}`);
+        console.log(`🚀 НОВАЯ СМС! ID: ${id}, Tel: ${phoneNumber}, Code: ${finalCode}`);
         
-        // Отправляем: Заголовок = Номер, Текст = Код
-        sendPushToAll(phoneNumber, `Код: ${finalCode}`);
+        // --- ИЩЕМ, ЧЕЙ ЭТО НОМЕР ---
+        let foundOwner = false;
+
+        Object.keys(clients).forEach(clientId => {
+          const client = clients[clientId];
+          
+          // Проверяем: есть ли этот ID номера в списке "слежения" у клиента?
+          if (client.watchedIds && client.watchedIds.includes(id)) {
+            // НАШЛИ ВЛАДЕЛЬЦА! Шлем только ему.
+            sendPushToClient(client.subscription, phoneNumber, `Код: ${finalCode}`);
+            foundOwner = true;
+          }
+        });
+
+        if (!foundOwner) {
+          console.log(`⚠️ Владелец номера ${id} не найден онлайн. Уведомление не отправлено.`);
+        }
         
-        // Запоминаем, что отправили
+        // Запоминаем, что код обработали
         lastSmsData[id] = finalCode;
       }
     });
@@ -129,37 +128,59 @@ const checkSmsLoop = async () => {
 // 3. РОУТЫ СЕРВЕРА
 // ==========================================
 
-// Прием подписки от клиента
+// 1. ПОДПИСКА (Теперь принимаем и clientId)
 app.post('/subscribe', (req, res) => {
-  const subscription = req.body;
+  const { subscription, clientId } = req.body;
   
-  const exists = subscribers.find(s => s.endpoint === subscription.endpoint);
-  if (!exists) {
-    subscribers.push(subscription);
-    console.log(`✅ Новый подписчик. Всего: ${subscribers.length}`);
+  if (!clientId || !subscription) {
+    return res.status(400).json({ error: 'Missing data' });
+  }
+
+  // Если клиента нет - создаем, если есть - обновляем подписку
+  if (!clients[clientId]) {
+    clients[clientId] = { subscription, watchedIds: [] };
+    console.log(`✅ Новый клиент зарегистрирован: ${clientId}`);
+  } else {
+    clients[clientId].subscription = subscription;
+    console.log(`🔄 Обновлена подписка для: ${clientId}`);
   }
   
   res.status(201).json({});
 });
 
-// Тестовая отправка (для отладки)
-app.get('/test-push', (req, res) => {
-  sendPushToAll('NEO Hub Test', 'Проверка связи!');
-  res.json({ status: 'sent', subscribersCount: subscribers.length });
+// 2. HEARTBEAT (Сердцебиение) - Клиент присылает список СВОИХ номеров
+// Этот роут нужно вызывать с фронтенда каждые 3-5 секунд
+app.post('/heartbeat', (req, res) => {
+  const { clientId, myActiveIds } = req.body;
+
+  if (clients[clientId]) {
+    // Обновляем список номеров, которые "слушает" этот клиент
+    clients[clientId].watchedIds = myActiveIds || [];
+    // console.log(`💓 Heartbeat ${clientId}: следит за ${clients[clientId].watchedIds.length} номерами`);
+  }
+
+  res.json({ status: 'ok' });
 });
 
-// --- ГЛАВНАЯ СТРАНИЦА (ДЛЯ UPTIMEROBOT) ---
-// Это нужно, чтобы мониторинг видел статус 200 OK
+// 3. Тестовая отправка (шлет ВСЕМ подключенным, для проверки)
+app.get('/test-push', (req, res) => {
+  const count = Object.keys(clients).length;
+  Object.values(clients).forEach(client => {
+    sendPushToClient(client.subscription, 'NEO Hub', 'Тестовое уведомление (Личное)');
+  });
+  res.json({ status: 'sent', clientsCount: count });
+});
+
+// 4. ГЛАВНАЯ СТРАНИЦА (ДЛЯ UPTIMEROBOT)
 app.get('/', (req, res) => {
   console.log('🤖 Ping from UptimeRobot!');
-  res.send('NeoHub Server is active! 🚀');
+  res.send('NeoHub Smart Server is active! 🚀');
 });
 
 // ==========================================
 // 4. ЗАПУСК
 // ==========================================
 
-// Запускаем цикл проверки каждые 3 секунды
 setInterval(checkSmsLoop, 3000);
 
 const PORT = process.env.PORT || 5000;
