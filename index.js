@@ -2,20 +2,19 @@ const express = require('express');
 const webpush = require('web-push');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const fetch = require('node-fetch');
+const fetch = require('node-fetch'); // Убедись, что node-fetch установлен в package.json
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- ТВОИ КЛЮЧИ (Я ИХ УЖЕ ВСТАВИЛ) ---
+// --- 1. КЛЮЧИ PWA (Твои ключи) ---
 const PUBLIC_VAPID_KEY = 'BOY5OXY2TLy2mrgrJKtpJx53RLAamrpHJ7GpuvHsaN2WKFcz8WHbwAeNEBgULGwkhTe6o0UR-FHqOjR2VbrpaaQ';
 const PRIVATE_VAPID_KEY = 'RJkp_M-bEsQdFhNcQ49jsQhnwHg-_2nrC-RBuNJUIDs';
 
-// --- НАСТРОЙКИ СЕРВИСА SMS ---
-const SMS_SERVICE_API_KEY = 'ТВОЙ_API_KEY_ОТ_5SIM_ИЛИ_SMS_ACTIVATE'; 
-// Пример URL (замени на реальный метод своего сервиса!)
-const SMS_API_URL = `https://api.sms-service.com/stubs/handler_api.php?api_key=${SMS_SERVICE_API_KEY}&action=getActiveActivations`;
+// --- 2. НАСТРОЙКИ HEROSMS ---
+const HERO_API_KEY = '0eA49025bAc743e0d3df93f215fc70b7'; 
+const HERO_URL = 'https://hero-sms.com/stubs/handler_api.php';
 
 // Настраиваем web-push
 webpush.setVapidDetails(
@@ -24,70 +23,126 @@ webpush.setVapidDetails(
   PRIVATE_VAPID_KEY
 );
 
-// Хранилище подписчиков (в памяти)
+// Хранилище подписчиков (iPhone/Android)
 let subscribers = [];
+
+// Хранилище уже отправленных СМС, чтобы не спамить
+let lastSmsData = {}; 
+
+// --- РОУТЫ ---
 
 // 1. Принимаем подписку от телефона
 app.post('/subscribe', (req, res) => {
   const subscription = req.body;
   
-  // Сохраняем, если такой еще нет
+  // Проверяем, нет ли уже такого подписчика
   const exists = subscribers.find(s => s.endpoint === subscription.endpoint);
   if (!exists) {
     subscribers.push(subscription);
-    console.log('✅ Новый iPhone подписался! Всего:', subscribers.length);
+    console.log(`✅ Новый подписчик! Всего устройств: ${subscribers.length}`);
   }
   
   res.status(201).json({});
 });
 
-// 2. Функция рассылки всем
+// 2. Тестовый роут (для проверки работы пушей вручную)
+app.get('/test-push', (req, res) => {
+  sendPushToAll('Это тестовое уведомление от NEO Hub!');
+  res.json({ status: 'sent', count: subscribers.length });
+});
+
+// --- ЛОГИКА РАССЫЛКИ ---
+
 const sendPushToAll = (text) => {
+  if (subscribers.length === 0) return;
+
   const payload = JSON.stringify({
     title: 'NEO Hub',
     body: text,
+    // icon: '/icon-192.png' // Можно добавить иконку
   });
+
+  console.log(`📤 Отправляем пуш: "${text}" на ${subscribers.length} устройств`);
 
   subscribers.forEach((sub, index) => {
     webpush.sendNotification(sub, payload).catch(err => {
-      console.error('Ошибка отправки:', err);
+      // Если устройство отписалось или токен устарел - удаляем его
       if (err.statusCode === 410 || err.statusCode === 404) {
-        subscribers.splice(index, 1); // Удаляем мертвую подписку
+        console.log('🗑 Удаляем неактивного подписчика');
+        subscribers.splice(index, 1); 
+      } else {
+        console.error('Ошибка отправки:', err.message);
       }
     });
   });
 };
 
-// 3. Робот, который проверяет SMS каждые 5 сек
-let lastSmsData = {}; 
+// --- ЛОГИКА ПРОВЕРКИ SMS (HEROSMS) ---
 
 const checkSmsLoop = async () => {
   try {
-    // Делаем запрос к API сервиса
-    // ВАЖНО: Убедись, что твой сервис возвращает JSON. Если текст - надо парсить.
-    const response = await fetch(SMS_API_URL);
-    const data = await response.json(); 
+    // Запрашиваем АКТИВНЫЕ активации
+    const url = `${HERO_URL}?api_key=${HERO_API_KEY}&action=getActiveActivations`;
+    
+    const response = await fetch(url);
+    const text = await response.text(); // Сначала берем текст, т.к. может прийти "NO_ACTIVATIONS"
 
-    if (Array.isArray(data)) {
-      data.forEach(activation => {
-        // Если пришел код И он новый
-        if (activation.smsText && lastSmsData[activation.id] !== activation.smsText) {
-          console.log(`📩 Новая SMS: ${activation.smsText}`);
-          
-          // ОТПРАВЛЯЕМ ПУШ
-          sendPushToAll(`Код: ${activation.smsCode || 'Получен'}\n${activation.smsText}`);
-          
-          lastSmsData[activation.id] = activation.smsText;
-        }
-      });
+    if (text === 'NO_ACTIVATIONS') {
+       // Номеров нет, ничего не делаем
+       return; 
     }
+
+    // Пытаемся распарсить JSON
+    let data;
+    try {
+        data = JSON.parse(text);
+    } catch (e) {
+        // Если пришла ошибка текстом (например BAD_KEY)
+        if (!text.includes('NO_ACTIVATIONS')) {
+            console.log('HeroSMS ответил странно:', text); 
+        }
+        return;
+    }
+
+    // Нормализуем данные (API может вернуть массив или объект)
+    let activations = [];
+    if (data.activeActivations) {
+      if (Array.isArray(data.activeActivations)) {
+        activations = data.activeActivations;
+      } else if (data.activeActivations.rows) {
+        activations = data.activeActivations.rows;
+      }
+    }
+
+    // Проверяем каждый активный номер
+    activations.forEach(item => {
+      const id = item.activationId;
+      const codeRaw = item.smsCode; // Может быть массив или строка
+      
+      // Берем код (если это массив, то первый элемент)
+      const finalCode = Array.isArray(codeRaw) ? codeRaw[0] : codeRaw;
+      const smsText = item.smsText || item.text || '';
+
+      // ГЛАВНОЕ УСЛОВИЕ: Код есть И мы его еще не видели для этого ID
+      if (finalCode && lastSmsData[id] !== finalCode) {
+        
+        console.log(`🚀 ПОЙМАЛИ КОД! ID: ${id}, Code: ${finalCode}`);
+        
+        // Отправляем пуш
+        sendPushToAll(`Код: ${finalCode}`);
+        
+        // Запоминаем, чтобы не отправлять повторно
+        lastSmsData[id] = finalCode;
+      }
+    });
+
   } catch (error) {
-    // console.error('Ошибка API (игнорируем):', error.message);
+    console.error('Ошибка в цикле проверки:', error.message);
   }
 };
 
-// Запуск цикла проверки
-setInterval(checkSmsLoop, 5000);
+// Запускаем проверку каждые 3 секунды
+setInterval(checkSmsLoop, 3000);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Сервер запущен на порту ${PORT}`));
