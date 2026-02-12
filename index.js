@@ -14,24 +14,20 @@ app.use(bodyParser.json());
 
 let serviceAccount;
 
-// Проверяем, есть ли переменная на Render
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
-    // Если есть, превращаем строку обратно в объект
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    console.log("✅ Ключи Firebase успешно загружены из настроек Render.");
+    console.log("✅ [SYSTEM] Ключи Firebase загружены из ENV.");
   } catch (e) {
-    console.error('❌ ОШИБКА: Переменная FIREBASE_SERVICE_ACCOUNT содержит кривой JSON!');
+    console.error('❌ [SYSTEM] ОШИБКА JSON в ENV переменной!');
     process.exit(1);
   }
 } else {
-  // Если переменной нет (например, ты запускаешь локально и файл лежит рядом)
   try {
     serviceAccount = require('./serviceAccountKey.json');
-    console.log("⚠️ Загрузка ключей из локального файла serviceAccountKey.json");
+    console.log("⚠️ [SYSTEM] Ключи загружены из локального файла.");
   } catch (e) {
-    console.error('❌ ОШИБКА: Не найдена переменная окружения FIREBASE_SERVICE_ACCOUNT и файл serviceAccountKey.json тоже отсутствует.');
-    console.error('👉 На Render: добавь переменную FIREBASE_SERVICE_ACCOUNT в настройках.');
+    console.error('❌ [SYSTEM] Ключи не найдены нигде!');
     process.exit(1);
   }
 }
@@ -57,48 +53,99 @@ webpush.setVapidDetails(
 );
 
 // ==========================================
-// 3. ЛОГИКА СЛУШАТЕЛЯ
+// 3. ЛОГИКА СЛУШАТЕЛЯ (МАКСИМАЛЬНЫЕ ЛОГИ)
 // ==========================================
 
 const ref = db.ref('activations');
 
+console.log('👀 [WATCHTOWER] Сервер запущен. Начинаю мониторинг базы...');
+
+// ЛОГЕР 1: ПОКАЗЫВАЕТ, КТО КУПИЛ НОМЕР И ЖДЕТ
+ref.on('child_added', (snapshot) => {
+  const id = snapshot.key;
+  const data = snapshot.val();
+  const hasToken = !!data.pushSubscription;
+  const phone = data.phoneNumber || 'Номер не определен';
+  const service = data.serviceName || 'Сервис';
+
+  // Логируем только активные, где еще нет кучи сообщений
+  // (чтобы не засорять лог при рестарте старыми заказами)
+  console.log(`🛒 [NEW ORDER] ID: ${id} | Tel: ${phone} (${service}) | Device Connected: ${hasToken ? '✅ YES' : '❌ NO'}`);
+});
+
+// ЛОГЕР 2: ОСНОВНАЯ РАБОТА (ПРИХОД СМС)
 ref.on('child_changed', (snapshot) => {
   const activationId = snapshot.key;
   const data = snapshot.val();
   
-  if (!data.messages || !data.pushSubscription) return;
+  // 1. Проверяем подписку
+  if (!data.pushSubscription) {
+    console.log(`⚠️ [SKIP] Пришло обновление для ${activationId}, но у клиента нет подписки на уведомления.`);
+    return;
+  }
+
+  // 2. Проверяем сообщения
+  if (!data.messages) return;
 
   const messages = data.messages;
   const subscription = data.pushSubscription;
 
+  // 3. Формируем красивый заголовок (Номер телефона или Сервис)
+  const titleText = data.phoneNumber 
+    ? `${data.phoneNumber}` 
+    : (data.serviceName ? `${data.serviceName} Code` : 'Новое СМС');
+
+  // 4. Перебираем сообщения
   Object.keys(messages).forEach(msgKey => {
     const message = messages[msgKey];
+    
+    // Если уже отправили - пропускаем
     if (message.pushSent) return;
 
-    const text = message.text || message.code || 'Код пришел!';
-    console.log(`📩 [${activationId}] Отправляем пуш: ${text}`);
+    // Чистим текст: если есть код - берем код, иначе текст (обрезанный)
+    let bodyText = '';
+    let logText = '';
+
+    if (message.code) {
+       bodyText = `Код: ${message.code}`;
+       logText = `CODE: ${message.code}`;
+    } else {
+       const raw = message.text || '';
+       bodyText = raw.length > 30 ? raw.substring(0, 30) + '...' : raw;
+       logText = `TEXT: ${raw.substring(0, 20)}...`;
+    }
+
+    console.log(`🔔 [SMS DETECTED] ID: ${activationId} | From: ${titleText} | Content: ${logText}`);
+    console.log(`   👉 Отправка Push-уведомления...`);
 
     const payload = JSON.stringify({
-      title: `Новое СМС!`,
-      body: text,
+      title: titleText,
+      body: bodyText,
       icon: 'https://cdn-icons-png.flaticon.com/512/561/561127.png'
     });
 
     webpush.sendNotification(subscription, payload)
       .then(() => {
+        console.log(`   ✅ [SUCCESS] Пуш успешно доставлен пользователю!`);
+        
+        // Помечаем в базе как отправленное
         db.ref(`activations/${activationId}/messages/${msgKey}`).update({
           pushSent: true
         });
       })
       .catch(err => {
+        console.error(`   ❌ [FAILED] Ошибка отправки: ${err.statusCode}`);
+        
+        // Если клиент отписался или токен протух
         if (err.statusCode === 410 || err.statusCode === 404) {
+           console.log(`   💀 [CLEANUP] Подписка мертва. Удаляю токен из базы для ${activationId}`);
            db.ref(`activations/${activationId}/pushSubscription`).remove();
         }
       });
   });
 });
 
-app.get('/', (req, res) => res.send('Backend Working 🚀'));
+app.get('/', (req, res) => res.send('Backend Watchtower Active 🛡️'));
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server started on ${PORT}`));
+app.listen(PORT, () => console.log(`🌍 Server port: ${PORT}`));
