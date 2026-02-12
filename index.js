@@ -62,14 +62,9 @@ const sendPushToClient = (subscription, title, body) => {
 /**
  * Основной цикл проверки SMS через HeroSMS API
  */
-/**
- * Основной цикл проверки SMS через HeroSMS API
- */
 const checkSmsLoop = async () => {
   try {
-    // === ИСПРАВЛЕНИЕ ЗДЕСЬ ===
-    // Добавили &limit=500&count=500, чтобы сервер видел ВСЕ номера, а не только первые 20
-    const url = `${HERO_URL}?api_key=${HERO_API_KEY}&action=getActiveActivations&limit=500&count=500`;
+    const url = `${HERO_URL}?api_key=${HERO_API_KEY}&action=getActiveActivations`;
     
     const response = await fetch(url);
     const text = await response.text(); 
@@ -116,7 +111,7 @@ const checkSmsLoop = async () => {
         });
 
         if (!foundOwner) {
-          // console.log(`⚠️ Владелец номера ${id} не найден. (Возможно, вкладка закрыта)`);
+          console.log(`⚠️ Владелец номера ${id} не найден онлайн. Уведомление не отправлено.`);
         }
         
         // Запоминаем, что код обработали
@@ -128,7 +123,6 @@ const checkSmsLoop = async () => {
     console.error('Ошибка цикла проверки SMS:', error.message);
   }
 };
-
 
 // ==========================================
 // 3. РОУТЫ СЕРВЕРА
