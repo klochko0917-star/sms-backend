@@ -151,6 +151,7 @@ app.get('/test-push', (req, res) => {
 // --- ГЛАВНАЯ СТРАНИЦА (ДЛЯ UPTIMEROBOT) ---
 // Это нужно, чтобы мониторинг видел статус 200 OK
 app.get('/', (req, res) => {
+  console.log('🤖 Ping from UptimeRobot!');
   res.send('NeoHub Server is active! 🚀');
 });
 
