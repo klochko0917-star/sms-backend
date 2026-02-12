@@ -2,74 +2,59 @@ const express = require('express');
 const webpush = require('web-push');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const fetch = require('node-fetch'); // Убедись, что node-fetch установлен в package.json
+const fetch = require('node-fetch'); // Убедись, что node-fetch установлен
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- 1. КЛЮЧИ PWA (Твои ключи) ---
+// ==========================================
+// 1. КОНФИГУРАЦИЯ И КЛЮЧИ
+// ==========================================
+
 const PUBLIC_VAPID_KEY = 'BOY5OXY2TLy2mrgrJKtpJx53RLAamrpHJ7GpuvHsaN2WKFcz8WHbwAeNEBgULGwkhTe6o0UR-FHqOjR2VbrpaaQ';
 const PRIVATE_VAPID_KEY = 'RJkp_M-bEsQdFhNcQ49jsQhnwHg-_2nrC-RBuNJUIDs';
 
-// --- 2. НАСТРОЙКИ HEROSMS ---
+// Настройки HeroSMS
 const HERO_API_KEY = '0eA49025bAc743e0d3df93f215fc70b7'; 
 const HERO_URL = 'https://hero-sms.com/stubs/handler_api.php';
 
-// Настраиваем web-push
+// Настройка библиотеки WebPush
 webpush.setVapidDetails(
   'mailto:admin@neohub.com',
   PUBLIC_VAPID_KEY,
   PRIVATE_VAPID_KEY
 );
 
-// Хранилище подписчиков (iPhone/Android)
+// Хранилище данных (в оперативной памяти)
 let subscribers = [];
-
-// Хранилище уже отправленных СМС, чтобы не спамить
 let lastSmsData = {}; 
 
-// --- РОУТЫ ---
+// ==========================================
+// 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ==========================================
 
-// 1. Принимаем подписку от телефона
-app.post('/subscribe', (req, res) => {
-  const subscription = req.body;
-  
-  // Проверяем, нет ли уже такого подписчика
-  const exists = subscribers.find(s => s.endpoint === subscription.endpoint);
-  if (!exists) {
-    subscribers.push(subscription);
-    console.log(`✅ Новый подписчик! Всего устройств: ${subscribers.length}`);
-  }
-  
-  res.status(201).json({});
-});
-
-// 2. Тестовый роут (для проверки работы пушей вручную)
-app.get('/test-push', (req, res) => {
-  sendPushToAll('Это тестовое уведомление от NEO Hub!');
-  res.json({ status: 'sent', count: subscribers.length });
-});
-
-// --- ЛОГИКА РАССЫЛКИ ---
-
-const sendPushToAll = (text) => {
+/**
+ * Отправляет Push-уведомление всем подписчикам
+ * @param {string} title - Заголовок (например, номер телефона)
+ * @param {string} body - Текст уведомления (например, код)
+ */
+const sendPushToAll = (title, body) => {
   if (subscribers.length === 0) return;
 
   const payload = JSON.stringify({
-    title: 'NEO Hub',
-    body: text,
-    // icon: '/icon-192.png' // Можно добавить иконку
+    title: title,
+    body: body,
   });
 
-  console.log(`📤 Отправляем пуш: "${text}" на ${subscribers.length} устройств`);
+  console.log(`📤 Push: [${title}] -> ${body}`);
 
   subscribers.forEach((sub, index) => {
     webpush.sendNotification(sub, payload).catch(err => {
-      // Если устройство отписалось или токен устарел - удаляем его
+      // Если устройство недоступно или отписалось (410 Gone, 404 Not Found)
       if (err.statusCode === 410 || err.statusCode === 404) {
-        console.log('🗑 Удаляем неактивного подписчика');
-        subscribers.splice(index, 1); 
+        subscribers.splice(index, 1); // Удаляем из списка
+        console.log('🗑 Удален неактивный подписчик');
       } else {
         console.error('Ошибка отправки:', err.message);
       }
@@ -77,34 +62,30 @@ const sendPushToAll = (text) => {
   });
 };
 
-// --- ЛОГИКА ПРОВЕРКИ SMS (HEROSMS) ---
-
+/**
+ * Основной цикл проверки SMS через HeroSMS API
+ */
 const checkSmsLoop = async () => {
   try {
-    // Запрашиваем АКТИВНЫЕ активации
     const url = `${HERO_URL}?api_key=${HERO_API_KEY}&action=getActiveActivations`;
     
+    // Делаем запрос
     const response = await fetch(url);
-    const text = await response.text(); // Сначала берем текст, т.к. может прийти "NO_ACTIVATIONS"
+    const text = await response.text(); 
 
-    if (text === 'NO_ACTIVATIONS') {
-       // Номеров нет, ничего не делаем
-       return; 
-    }
+    // Если номеров нет, API возвращает строку
+    if (text === 'NO_ACTIVATIONS') return;
 
-    // Пытаемся распарсить JSON
+    // Пробуем парсить JSON
     let data;
     try {
         data = JSON.parse(text);
     } catch (e) {
-        // Если пришла ошибка текстом (например BAD_KEY)
-        if (!text.includes('NO_ACTIVATIONS')) {
-            console.log('HeroSMS ответил странно:', text); 
-        }
+        // Игнорируем ошибки парсинга, если это не валидный JSON
         return;
     }
 
-    // Нормализуем данные (API может вернуть массив или объект)
+    // Нормализация данных (API может вернуть объект или массив)
     let activations = [];
     if (data.activeActivations) {
       if (Array.isArray(data.activeActivations)) {
@@ -114,34 +95,64 @@ const checkSmsLoop = async () => {
       }
     }
 
-    // Проверяем каждый активный номер
+    // Проходим по всем активным номерам
     activations.forEach(item => {
       const id = item.activationId;
-      const codeRaw = item.smsCode; // Может быть массив или строка
+      const codeRaw = item.smsCode;
       
-      // Берем код (если это массив, то первый элемент)
+      // HeroSMS иногда шлет код массивом, иногда строкой
       const finalCode = Array.isArray(codeRaw) ? codeRaw[0] : codeRaw;
-      const smsText = item.smsText || item.text || '';
 
-      // ГЛАВНОЕ УСЛОВИЕ: Код есть И мы его еще не видели для этого ID
+      // Формируем красивый номер телефона для заголовка
+      const phoneNumber = item.phoneNumber ? `+${item.phoneNumber}` : 'SMS Code';
+
+      // ЛОГИКА ОТПРАВКИ:
+      // Если код есть (не null) И мы этот код для этого ID еще не отправляли
       if (finalCode && lastSmsData[id] !== finalCode) {
         
-        console.log(`🚀 ПОЙМАЛИ КОД! ID: ${id}, Code: ${finalCode}`);
+        console.log(`🚀 НОВАЯ СМС! Tel: ${phoneNumber}, Code: ${finalCode}`);
         
-        // Отправляем пуш
-        sendPushToAll(`Код: ${finalCode}`);
+        // Отправляем: Заголовок = Номер, Текст = Код
+        sendPushToAll(phoneNumber, `Код: ${finalCode}`);
         
-        // Запоминаем, чтобы не отправлять повторно
+        // Запоминаем, что отправили
         lastSmsData[id] = finalCode;
       }
     });
 
   } catch (error) {
-    console.error('Ошибка в цикле проверки:', error.message);
+    console.error('Ошибка цикла проверки SMS:', error.message);
   }
 };
 
-// Запускаем проверку каждые 3 секунды
+// ==========================================
+// 3. РОУТЫ СЕРВЕРА
+// ==========================================
+
+// Прием подписки от клиента
+app.post('/subscribe', (req, res) => {
+  const subscription = req.body;
+  
+  const exists = subscribers.find(s => s.endpoint === subscription.endpoint);
+  if (!exists) {
+    subscribers.push(subscription);
+    console.log(`✅ Новый подписчик. Всего: ${subscribers.length}`);
+  }
+  
+  res.status(201).json({});
+});
+
+// Тестовая отправка (для отладки)
+app.get('/test-push', (req, res) => {
+  sendPushToAll('NEO Hub Test', 'Проверка связи!');
+  res.json({ status: 'sent', subscribersCount: subscribers.length });
+});
+
+// ==========================================
+// 4. ЗАПУСК
+// ==========================================
+
+// Запускаем цикл проверки каждые 3 секунды
 setInterval(checkSmsLoop, 3000);
 
 const PORT = process.env.PORT || 5000;
