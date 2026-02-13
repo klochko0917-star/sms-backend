@@ -151,8 +151,9 @@ ref.on('child_changed', (snapshot) => {
     
     let bodyText = '';
     
-    if (message.code) {
-       bodyText = `${message.code}`; // В тело пуша только код
+     if (message.code) {
+       // ✅ ИСПРАВЛЕНО: Добавлено слово "Код: "
+       bodyText = `Код: ${message.code}`; 
        console.log(`   🔑 КОД: ${message.code}`);
     } else {
        const raw = message.text || '';
