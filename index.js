@@ -5,7 +5,6 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const PNF = require('google-libphonenumber').PhoneNumberFormat;
 const phoneUtil = require('google-libphonenumber').PhoneNumberUtil.getInstance();
-const axios = require('axios'); // ✅ ДОБАВИЛ AXIOS ДЛЯ ЗАПРОСОВ К SMS
 
 const app = express();
 app.use(cors());
@@ -80,81 +79,7 @@ function formatPhoneNumber(rawNumber) {
 }
 
 // ==========================================
-// 4.5. ФОНОВЫЙ ОПРОС (ЭТО Я ДОБАВИЛ)
-// ==========================================
-
-// Твои настройки API (взяты из твоего apiService.js)
-const SMS_API_KEY = '0eA49025bAc743e0d3df93f215fc70b7'; 
-// !!! ВНИМАНИЕ: Здесь должен быть реальный URL провайдера. 
-// Я оставил дефолтный SMS-Activate. Если у тебя другой (5sim и тд) - замени URL ниже.
-const SMS_PROVIDER_URL = 'https://api.sms-activate.org/stubs/handler_api.php'; 
-
-async function checkSmsProvider() {
-  try {
-    // 1. Запрос к API
-    const response = await axios.get(SMS_PROVIDER_URL, {
-      params: { api_key: SMS_API_KEY, action: 'getActiveActivations' }
-    });
-    
-    const data = response.data;
-    if (!data || data === 'NO_ACTIVATIONS') return;
-
-    // 2. Парсинг
-    let list = [];
-    if (data.activeActivations) {
-        if (Array.isArray(data.activeActivations)) list = data.activeActivations;
-        else if (data.activeActivations.rows) list = data.activeActivations.rows;
-        else if (data.activeActivations.row) list = [data.activeActivations.row];
-    }
-
-    // 3. Обработка
-    for (const item of list) {
-      const smsCode = (Array.isArray(item.smsCode) ? item.smsCode[0] : item.smsCode);
-      if (!smsCode) continue;
-
-      const id = item.activationId;
-      const safeKey = String(smsCode).replace(/[.#$\/\[\]]/g, "");
-
-      // 4. Проверяем базу Firebase (есть ли такая активация у нас)
-      const actRef = db.ref(`activations/${id}`);
-      const actSnap = await actRef.once('value');
-      
-      if (!actSnap.exists()) continue; // Чужой номер
-
-      // 5. Проверяем сообщение
-      const msgRef = db.ref(`activations/${id}/messages/${safeKey}`);
-      const msgSnap = await msgRef.once('value');
-
-      // Если новое -> пишем в базу
-      if (!msgSnap.exists()) {
-        console.log(`✨ [POLLING] Нашел новый код для ID ${id}: ${smsCode}`);
-        
-        await msgRef.set({
-          code: String(smsCode),
-          text: item.text || item.smsText || 'Текст не получен',
-          timestamp: Date.now(),
-          pushSent: false // !!! Важно: false, чтобы сработал твой слушатель ниже
-        });
-
-        // Обновляем статус самой активации
-        await actRef.update({ 
-           smsCode: String(smsCode),
-           status: 'Active'
-        });
-      }
-    }
-  } catch (e) {
-    // Тихо игнорируем ошибки сети, чтобы не спамить в лог
-  }
-}
-
-// Запускаем опрос каждые 3 секунды
-setInterval(checkSmsProvider, 3000);
-console.log('🤖 [POLLING] Фоновая проверка API запущена (3 сек).');
-
-
-// ==========================================
-// 4. ЛОГИКА СЛУШАТЕЛЯ (MEGA LOGS) - ТВОЙ КОД
+// 4. ЛОГИКА СЛУШАТЕЛЯ (MEGA LOGS)
 // ==========================================
 
 const ref = db.ref('activations');
